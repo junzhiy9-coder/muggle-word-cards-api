@@ -8,7 +8,8 @@ Python 3.11+ / FastAPI / SQLite，不需要装数据库、不需要服务器也�
 ```
 backend/
 ├── app/
-│   ├── main.py       接口（extract / import / groups / review / due / wanted / health）
+│   ├── main.py       接口（auth / extract / import / groups / review / due / wanted / health）
+│   ├── auth.py       密码 bcrypt 哈希 + JWT 签发/校验（HS256，30 天）
 │   ├── db.py         SQLite 表结构 + 增删改查（标准库 sqlite3）
 │   ├── ocr.py        本地 Tesseract OCR + 云端 OCR 预留桩
 │   ├── llm.py        DeepSeek 客户端（Key 只从环境变量读）
@@ -49,7 +50,10 @@ cp .env.example .env          # 然后把 DEEPSEEK_API_KEY 填进去
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/health` | 健康检查 |
+| GET | `/health` | 健康检查（公开） |
+| POST | `/api/auth/register` | 注册：`{"email","password","name?"}` → 201 `{"token","user"}`；邮箱已存在 409，邮箱格式错/密码 < 6 位 400 |
+| POST | `/api/auth/login` | 登录：`{"email","password"}` → `{"token","user"}`；凭证错误 401 |
+| GET | `/api/auth/me` | 当前登录用户（需 Bearer token） |
 | POST | `/api/extract` | 传 1–3 张图片（multipart），返回草稿（不保存）。每天每 IP 限 20 次 |
 | POST | `/api/import` | 传确认过的草稿 JSON，存成新分组；已在库里的词自动跳过 |
 | GET | `/api/groups` | 分组列表（含每组词数） |
@@ -57,6 +61,28 @@ cp .env.example .env          # 然后把 DEEPSEEK_API_KEY 填进去
 | POST | `/api/review/{word_id}` | `{"known": true/false, "pass_number": 1/2/3（可选）}`，按阶梯排期 |
 | GET | `/api/review/due` | 今天到期的词 |
 | GET | `/api/wanted` | 通缉名单（连续答错 ≥ 2 次） |
+
+> 除 `/health` 外，全部 `/api/*` 接口都要在请求头带 `Authorization: Bearer <token>`，
+> 没带或 token 无效/过期返回 401。数据按登录用户隔离：每个用户只能看到自己的
+> 分组和单词，读别人的分组/单词返回 404。
+
+## 账号系统
+
+- 注册：邮箱唯一（重复 409），密码 bcrypt 哈希入库，明文绝不保存；
+  注册成功直接返回 token，前端存下来（localStorage）即可，后续请求都带上它。
+- 登录：邮箱或密码错都返回同一个 401，不透露是哪一步错了。
+- Token：JWT（HS256），有效期 30 天，过期重新登录。payload 里只有用户 id。
+- 密钥 `JWT_SECRET`：签发 token 用的。本地开发不填也能跑（启动时随机生成，
+  但重启后旧 token 全部失效）；**Render 上必须配固定值**，否则每次重新部署
+  都会把所有用户踢下线。生成一个：
+  ```bash
+  python -c "import secrets; print(secrets.token_urlsafe(32))"
+  ```
+  本地：写进 `.env` 的 `JWT_SECRET=`；Render：服务面板左侧 Environment 里添加
+  `JWT_SECRET`，保存后服务自动重启。
+- 老库迁移：账号系统上线前建的数据库，启动时自动给 users 表补 `email` /
+  `password_hash` 两列，已有数据不用删。老默认用户（id=1）没有邮箱密码，
+  不能登录，只能用新注册的账号走接口；它名下的旧数据不受影响。
 
 ### 复习规则（和主版本一致）
 
@@ -70,14 +96,17 @@ cp .env.example .env          # 然后把 DEEPSEEK_API_KEY 填进去
 仓库里已有 `Dockerfile` + `render.yaml`，按下面走：
 
 1. **传代码到 GitHub**：新建一个仓库（名字随意，如 `muggle-word-cards-api`），
-   把 `backend/` 文件夹里的全部内容传上去，仓库根目录就是这些文件。
+   把 `backend/` 文件夹**里面**的文件传上去（Dockerfile、render.yaml、requirements.txt、
+   app/ 等直接放在仓库根目录，不要套一层 backend/ 文件夹）。
    不用命令行也行：GitHub 网页里点 Add file → Upload files，直接把文件夹里的文件拖进去。
    注意：`.env` 里有你的 Key，**绝不能传**（`.gitignore` 和 `.dockerignore` 已经排除了它，传之前再检查一遍）。
 2. **Render 注册**：去 https://render.com ，用 GitHub 账号直接登录（不用另外注册）。
 3. **新建服务**：New → Web Service → 选刚传的仓库 → Render 会自动读到 `render.yaml`，
    确认计划是 Free，点 Create Web Service，等它构建（第一次几分钟）。
-4. **填 Key**：服务建好后，在 Render 面板左侧 Environment 里加一条
-   `DEEPSEEK_API_KEY`，值就是你的 DeepSeek Key，保存后服务会自动重启。
+4. **填 Key**：服务建好后，在 Render 面板左侧 Environment 里加两条：
+   `DEEPSEEK_API_KEY`（值就是你的 DeepSeek Key）和 `JWT_SECRET`（账号系统的
+   签名密钥，生成方法见上面「账号系统」一节；不配的话每次部署都会把所有用户
+   踢下线）。保存后服务会自动重启。
 5. **验证**：打开 `https://<你的服务名>.onrender.com/health`，看到 `{"status":"ok"}` 就是上线了。
    拿到地址后把地址发给 Vivian，她把试用版的拍照按钮接到这个接口上，拍照提取就真跑起来了。
 
@@ -95,8 +124,7 @@ cp .env.example .env          # 然后把 DEEPSEEK_API_KEY 填进去
 
 ## 还没做的事（有意的）
 
-- **用户账号/登录**：现在是单人使用，固定默认用户。以后加注册登录时，
-  把 `DEFAULT_USER_ID` 换成登录用户 id 即可，表结构不用改。
+- **找回密码/改密码**：注册登录已做，忘密码只能在数据库里手动处理，以后再加邮箱验证。
 - **前端页面**：这个仓库只有后端 API。前端（试用版静态页在 `muggle-word-cards-shi-yong-ban`）
   调这些接口即可，部署时把前端静态文件和后端放同一个域名下。
 - **云端 OCR**：`app/ocr.py` 里留了桩，没实现。

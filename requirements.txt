@@ -5,6 +5,8 @@ uvicorn[standard]
 python-multipart          # 解析图片上传（multipart/form-data）
 httpx                     # 调 DeepSeek API
 python-dotenv             # 读 .env
+pyjwt                     # 登录 token（JWT，HS256）
+bcrypt                    # 密码哈希
 Pillow                    # OCR 前处理图片
 pytesseract               # 可选：本地 Tesseract OCR 的 Python 封装。
                           # 注意：只装这个包不够，还要在系统里装 tesseract 可执行文件
