@@ -1,0 +1,20 @@
+# Render Blueprint：一键部署后端
+# 用法：backend/ 文件夹推到 GitHub（仓库根目录就是这些文件）后，
+# 在 Render 里选 New → Web Service → 连上这个仓库，Render 会自动读这个文件建服务。
+# 注意：DEEPSEEK_API_KEY 绝不写进仓库，在 Render 面板 Environment 里填。
+services:
+  - type: web
+    name: muggle-word-cards-api
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DEEPSEEK_MODEL
+        value: deepseek-chat
+      - key: OCR_PROVIDER
+        value: tesseract
+      - key: EXTRACT_DAILY_LIMIT
+        value: 20
