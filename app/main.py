@@ -1,7 +1,10 @@
 # Muggle Word Cards — 后端 API（FastAPI + SQLite）
 # -*- coding: utf-8 -*-
 """接口一览：
-- GET  /health                  健康检查
+- GET  /health                  健康检查（公开）
+- POST /api/auth/register       注册账号 -> {token, user}
+- POST /api/auth/login          登录 -> {token, user}
+- GET  /api/auth/me            当前登录用户（需 Bearer token）
 - POST /api/extract             上传 1-3 张图片 -> OCR -> DeepSeek 提取 -> 返回草稿（不保存）
 - POST /api/import              把确认过的草稿存成新分组（自动跳过已在库里的词）
 - GET  /api/groups              分组列表（含每组词数）
@@ -9,6 +12,10 @@
 - POST /api/review/{word_id}    记录一次复习结果（认识/不认识），按阶梯排期
 - GET  /api/review/due          今天到期的词
 - GET  /api/wanted               通缉名单（连续答错 >= 2 次的词）
+
+鉴权：除 /health 外全部 /api/* 接口都要求请求头带
+Authorization: Bearer <token>，否则 401；数据按登录用户 id 隔离，
+查别人的分组/单词一律返回 404（不泄露存在性）。
 
 复习规则（和主版本完全一致）：
 - 阶梯 LADDER = [1, 2, 4, 7, 15, 30] 天
@@ -21,15 +28,19 @@
 from __future__ import annotations
 
 import os
+import re
+import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
 
+import jwt
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from . import db
+from . import auth, db
 from .llm import DeepSeekClient, LLMError
 from .ocr import OCRError, ocr_image
 from .ratelimit import DailyRateLimiter, get_client_ip
@@ -45,7 +56,8 @@ DB_PATH = _db_path if _db_path.is_absolute() else BASE_DIR / _db_path
 LADDER = [1, 2, 4, 7, 15, 30]
 MAX_IMAGES = 3
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 单张图片 10MB 上限
-DEFAULT_USER_ID = 1  # 单人使用：固定默认用户。以后加账号系统再按登录用户区分。
+DEFAULT_USER_ID = 1  # 启动时保留的默认本地用户（单人使用时代的数据）。
+# 接口不再用它：全部 /api/* 数据接口都按登录用户的 id 隔离，见 get_current_user。
 
 limiter = DailyRateLimiter(int(os.getenv("EXTRACT_DAILY_LIMIT", "20")))
 
@@ -94,6 +106,85 @@ class ReviewRequest(BaseModel):
     )
 
 
+class RegisterRequest(BaseModel):
+    email: str = Field(..., description="邮箱，登录用")
+    password: str = Field(..., description="密码，至少 6 位")
+    name: str | None = Field(default=None, description="昵称，不填默认用邮箱前缀")
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+# ---------- 鉴权 ----------
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MIN_PASSWORD_LEN = 6
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _public_user(user: dict) -> dict:
+    """返回给前端的用户信息：绝不带 password_hash。"""
+    return {"id": user["id"], "email": user.get("email"), "name": user["name"]}
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> dict:
+    """依赖：解析 Authorization: Bearer <token>，返回登录用户（users 表整行）。
+
+    没带 token、token 无效/过期、用户不存在，一律 401。
+    """
+    if credentials is None:
+        raise HTTPException(401, "需要登录：请在请求头带 Authorization: Bearer <token>")
+    try:
+        user_id = auth.decode_token(credentials.credentials)
+    except jwt.PyJWTError:
+        raise HTTPException(401, "token 无效或已过期，请重新登录")
+    user = db.get_user_by_id(DB_PATH, user_id)
+    if user is None:
+        raise HTTPException(401, "用户不存在，请重新登录")
+    return user
+
+
+@app.post("/api/auth/register", status_code=201)
+def register(payload: RegisterRequest) -> dict:
+    email = payload.email.strip().lower()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, "邮箱格式不正确")
+    if len(payload.password) < MIN_PASSWORD_LEN:
+        raise HTTPException(400, f"密码至少 {MIN_PASSWORD_LEN} 位")
+    name = (payload.name or "").strip() or email.split("@")[0]
+    try:
+        user_id = db.create_user(DB_PATH, email, name, auth.hash_password(payload.password))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "该邮箱已注册，请直接登录")
+    user = db.get_user_by_id(DB_PATH, user_id)
+    return {"token": auth.create_token(user_id), "user": _public_user(user)}
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginRequest) -> dict:
+    email = payload.email.strip().lower()
+    user = db.get_user_by_email(DB_PATH, email)
+    # 邮箱不存在、没设密码（老默认用户）、密码不对，都返回同一个 401，
+    # 不告诉调用方到底是哪一步错了。
+    if (
+        user is None
+        or not user.get("password_hash")
+        or not auth.verify_password(payload.password, user["password_hash"])
+    ):
+        raise HTTPException(401, "邮箱或密码错误")
+    return {"token": auth.create_token(user["id"]), "user": _public_user(user)}
+
+
+@app.get("/api/auth/me")
+def me(user: dict = Depends(get_current_user)) -> dict:
+    return _public_user(user)
+
+
 # ---------- 健康检查 ----------
 
 @app.get("/health")
@@ -106,6 +197,7 @@ def health() -> dict:
 @app.post("/api/extract")
 async def extract(
     request: Request,
+    user: dict = Depends(get_current_user),
     files: list[UploadFile] = File(...),
     exam: str = Form("cet6"),
 ) -> dict:
@@ -156,8 +248,9 @@ async def extract(
 # ---------- 入库：确认过的草稿存成新分组 ----------
 
 @app.post("/api/import")
-def import_words(payload: ImportRequest) -> dict:
-    group_id = db.create_group(DB_PATH, DEFAULT_USER_ID, payload.group_label, payload.source)
+def import_words(payload: ImportRequest, user: dict = Depends(get_current_user)) -> dict:
+    user_id = user["id"]
+    group_id = db.create_group(DB_PATH, user_id, payload.group_label, payload.source)
     imported: list[str] = []
     skipped: list[str] = []
     seen_in_batch: set[str] = set()
@@ -165,14 +258,14 @@ def import_words(payload: ImportRequest) -> dict:
         key = w.word.strip().lower()
         if not key:
             continue
-        if key in seen_in_batch or db.word_exists(DB_PATH, DEFAULT_USER_ID, w.word):
+        if key in seen_in_batch or db.word_exists(DB_PATH, user_id, w.word):
             skipped.append(w.word)  # 已在库里的词跳过，不动它原来的进度
             continue
         seen_in_batch.add(key)
         db.insert_word(
             DB_PATH,
             group_id=group_id,
-            user_id=DEFAULT_USER_ID,
+            user_id=user_id,
             word=w.word,
             phonetic=w.phonetic,
             meaning=w.meaning,
@@ -187,15 +280,15 @@ def import_words(payload: ImportRequest) -> dict:
 # ---------- 分组与单词 ----------
 
 @app.get("/api/groups")
-def list_groups() -> list[dict]:
-    return db.list_groups(DB_PATH, DEFAULT_USER_ID)
+def list_groups(user: dict = Depends(get_current_user)) -> list[dict]:
+    return db.list_groups(DB_PATH, user["id"])
 
 
 @app.get("/api/groups/{group_id}/words")
-def list_group_words(group_id: int) -> list[dict]:
-    if not db.group_exists(DB_PATH, group_id):
+def list_group_words(group_id: int, user: dict = Depends(get_current_user)) -> list[dict]:
+    if not db.group_exists(DB_PATH, group_id, user["id"]):
         raise HTTPException(404, f"分组 {group_id} 不存在")
-    return db.list_words_in_group(DB_PATH, group_id)
+    return db.list_words_in_group(DB_PATH, group_id, user["id"])
 
 
 # ---------- 复习 ----------
@@ -225,9 +318,10 @@ def _apply_review_rules(word: dict, known: bool, pass_number: int | None, today:
 
 
 @app.post("/api/review/{word_id}")
-def review_word(word_id: int, payload: ReviewRequest) -> dict:
+def review_word(word_id: int, payload: ReviewRequest, user: dict = Depends(get_current_user)) -> dict:
     word = db.get_word(DB_PATH, word_id)
-    if word is None:
+    # 别人的单词按不存在处理（404），不泄露存在性。
+    if word is None or word["user_id"] != user["id"]:
         raise HTTPException(404, f"单词 {word_id} 不存在")
     if payload.pass_number is not None and payload.pass_number not in (1, 2, 3):
         raise HTTPException(400, "pass_number 只能是 1、2、3（或不传）")
@@ -243,10 +337,10 @@ def review_word(word_id: int, payload: ReviewRequest) -> dict:
 
 
 @app.get("/api/review/due")
-def due_today() -> list[dict]:
-    return db.due_words(DB_PATH, DEFAULT_USER_ID)
+def due_today(user: dict = Depends(get_current_user)) -> list[dict]:
+    return db.due_words(DB_PATH, user["id"])
 
 
 @app.get("/api/wanted")
-def wanted() -> list[dict]:
-    return db.wanted_words(DB_PATH, DEFAULT_USER_ID)
+def wanted(user: dict = Depends(get_current_user)) -> list[dict]:
+    return db.wanted_words(DB_PATH, user["id"])

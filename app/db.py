@@ -1,8 +1,10 @@
 # Muggle Word Cards — SQLite 数据层（标准库 sqlite3，不需要装数据库）
 # -*- coding: utf-8 -*-
 """表结构说明：
-- users：预留用户表。现在是单人使用，只有一个默认用户（id=1，名字 local）。
-  以后加账号系统时，每个用户的数据用 user_id 隔离即可，不用改表结构。
+- users：账号系统的用户表。email 唯一、password_hash 存 bcrypt 哈希（明文密码
+  绝不入库）。老库通过 init_db 里的 ALTER TABLE 迁移补列，不用删库。
+  默认用户（id=1，名字 local）是单人使用时代留下的本地数据，没有邮箱和密码，
+  不能登录；接口只认登录用户的数据。
 - groups：一个分组 = 一篇文章（或一次拍照提取）产出的一批词。
 - words：单词卡本体。stage 是复习阶梯的位置（见 main.py 的 LADDER），
   due_on 是下次到期日（YYYY-MM-DD），fail_streak 是连续答错次数。
@@ -16,9 +18,11 @@ from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT NOT NULL DEFAULT 'local',
-    created_at TEXT NOT NULL
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL DEFAULT 'local',
+    email         TEXT UNIQUE,
+    password_hash TEXT,
+    created_at    TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS groups (
@@ -73,11 +77,23 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | Path) -> None:
-    """建库（不存在则创建文件和表）。服务启动时调用一次。"""
+    """建库（不存在则创建文件和表）。服务启动时调用一次。
+
+    老库迁移：账号系统上线前建的库 users 表没有 email / password_hash 两列，
+    这里用 ALTER TABLE 补上（列已存在时跳过），已有数据不用删。
+    """
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        # 注意：SQLite 不允许 ALTER TABLE 直接加 UNIQUE 列，所以 email 先加普通列，
+        # 再建唯一索引来实现唯一约束（NULL 不计入唯一性，老默认用户不受影响）。
+        if "email" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        if "password_hash" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
 
 
 def ensure_user(db_path: str | Path, user_id: int = 1, name: str = "local") -> None:
@@ -86,6 +102,32 @@ def ensure_user(db_path: str | Path, user_id: int = 1, name: str = "local") -> N
             "INSERT OR IGNORE INTO users (id, name, created_at) VALUES (?, ?, ?)",
             (user_id, name, today_str()),
         )
+
+
+def create_user(db_path: str | Path, email: str, name: str, password_hash: str) -> int:
+    """新建账号。邮箱已存在时抛 sqlite3.IntegrityError（调用方转 409）。"""
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO users (email, name, password_hash, created_at) VALUES (?, ?, ?, ?)",
+            (email, name, password_hash, today_str()),
+        )
+        return cur.lastrowid
+
+
+def get_user_by_email(db_path: str | Path, email: str) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE email = ?", (email,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_user_by_id(db_path: str | Path, user_id: int) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def create_group(db_path: str | Path, user_id: int, label: str, source: str | None = None) -> int:
@@ -148,18 +190,22 @@ def list_groups(db_path: str | Path, user_id: int) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def list_words_in_group(db_path: str | Path, group_id: int) -> list[dict]:
+def list_words_in_group(db_path: str | Path, group_id: int, user_id: int) -> list[dict]:
+    """某分组下的全部单词，只返回该用户的（分组归属在调用方先校验）。"""
     with connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM words WHERE group_id = ? ORDER BY id", (group_id,)
+            "SELECT * FROM words WHERE group_id = ? AND user_id = ? ORDER BY id",
+            (group_id, user_id),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def group_exists(db_path: str | Path, group_id: int) -> bool:
+def group_exists(db_path: str | Path, group_id: int, user_id: int) -> bool:
+    """分组存在且属于该用户。别人的分组一律按不存在处理（接口返回 404）。"""
     with connect(db_path) as conn:
         return conn.execute(
-            "SELECT 1 FROM groups WHERE id = ? LIMIT 1", (group_id,)
+            "SELECT 1 FROM groups WHERE id = ? AND user_id = ? LIMIT 1",
+            (group_id, user_id),
         ).fetchone() is not None
 
 
