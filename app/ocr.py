@@ -33,6 +33,20 @@ def ocr_image(image_bytes: bytes, lang: str = "eng") -> str:
     except Exception as exc:
         raise OCRError(f"图片无法打开：{exc}")
 
+    # 手机照片动辄几千万像素，免费版小服务器上 Tesseract 跑大图特别慢。
+    # 先在服务端也压一下：最长边超过 2000 像素就等比缩小，并转灰度，
+    # 英文印刷体识别几乎不受影响，速度能快好几倍。
+    try:
+        if max(image.size) > 2000:
+            ratio = 2000 / max(image.size)
+            image = image.resize(
+                (int(image.width * ratio), int(image.height * ratio))
+            )
+        if image.mode != "L":
+            image = image.convert("L")
+    except Exception as exc:
+        raise OCRError(f"图片预处理失败：{exc}")
+
     try:
         return pytesseract.image_to_string(image, lang=lang)
     except pytesseract.TesseractNotFoundError:

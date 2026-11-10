@@ -25,7 +25,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -104,7 +104,11 @@ def health() -> dict:
 # ---------- 提取：拍照 -> OCR -> 大模型（只出草稿，不保存） ----------
 
 @app.post("/api/extract")
-async def extract(request: Request, files: list[UploadFile] = File(...)) -> dict:
+async def extract(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    exam: str = Form("cet6"),
+) -> dict:
     if not 1 <= len(files) <= MAX_IMAGES:
         raise HTTPException(400, f"一次请上传 1-{MAX_IMAGES} 张图片")
 
@@ -134,7 +138,7 @@ async def extract(request: Request, files: list[UploadFile] = File(...)) -> dict
 
     try:
         client = DeepSeekClient()
-        draft = await client.extract_words(passage)
+        draft = await client.extract_words(passage, exam=exam)
     except RuntimeError as exc:  # 没配 Key
         raise HTTPException(503, str(exc))
     except LLMError as exc:
@@ -143,6 +147,7 @@ async def extract(request: Request, files: list[UploadFile] = File(...)) -> dict
     return {
         "group_label": draft["group_label"],
         "words": draft["words"],
+        "exam": (exam or "cet6").strip().lower() or "cet6",
         "passage_chars": len(passage),
         "remaining_today": limiter.remaining(ip),
     }

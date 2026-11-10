@@ -15,7 +15,7 @@ import os
 
 import httpx
 
-from .prompts import EXTRACTION_SYSTEM_PROMPT
+from .prompts import get_extraction_prompt
 
 
 class LLMError(Exception):
@@ -76,14 +76,16 @@ class DeepSeekClient:
         self.base_url = (base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")).rstrip("/")
         self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-    async def extract_words(self, passage_text: str) -> dict:
+    async def extract_words(self, passage_text: str, exam: str | None = None) -> dict:
         """输入 OCR 识别出的文章全文，返回 {"group_label": ..., "words": [...]}。
 
+        exam 是用户定的考试（cet4 / cet6 / kaoyan / ielts / toefl），
+        决定按哪个级别筛词；不传或传了未知值时默认 CET-6。
         JSON 解析失败时自动重试一次：第二次请求会把第一次的坏输出贴回去，
         明确要求模型只返回合法 JSON。两次都失败才抛 LLMError。
         """
         messages: list[dict] = [
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "system", "content": get_extraction_prompt(exam)},
             {
                 "role": "user",
                 "content": "以下是 OCR 识别出的英文文章（可能含少量识别错误，请按上下文理解）：\n\n" + passage_text,
